@@ -1,15 +1,18 @@
 package main
 
 import (
+	"bufio"
+	"context" // Added for context.Background()
 	"flag"
-	"fmt"
+	"fmt" // Added for fmt.Errorf
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
+	"sort" // Added for sorting results
 	"strings"
-	"bufio"
+	"time" // Added for time.Duration
 
 	"github.com/google/namebench/dnsqueue"
 	"github.com/google/namebench/history"
@@ -38,13 +41,38 @@ var defaultDomains = []string{
 
 // openWindow opens a nodejs-webkit window, and points it at the given URL.
 func openWindow(url string) (err error) {
+	// Pre-check that nw_path exists and is a file
+	if _, err := os.Stat(*nw_path); os.IsNotExist(err) {
+		newErr := fmt.Errorf("node-webkit binary not found at %s, please check path or installation: %w", *nw_path, err)
+		log.Println(newErr) // Log the specific error
+		return newErr
+	} else if err != nil { // Other error with os.Stat (e.g. permission denied)
+		newErr := fmt.Errorf("error checking node-webkit binary at %s: %w", *nw_path, err)
+		log.Println(newErr)
+		return newErr
+	}
+
+	// Pre-check that nw_package exists and is a file (or directory, depending on how nw.js uses it)
+	// For app.nw, it's typically a zip file or a directory. Stat is fine.
+	if _, err := os.Stat(*nw_package); os.IsNotExist(err) {
+		newErr := fmt.Errorf("node-webkit package not found at %s: %w", *nw_package, err)
+		log.Println(newErr) // Log the specific error
+		return newErr
+	} else if err != nil { // Other error with os.Stat
+		newErr := fmt.Errorf("error checking node-webkit package at %s: %w", *nw_package, err)
+		log.Println(newErr)
+		return newErr
+	}
+
 	os.Setenv("APP_URL", url)
 	cmd := exec.Command(*nw_path, *nw_package)
 	if err := cmd.Run(); err != nil {
-		log.Printf("error running %s %s: %s", *nw_path, *nw_package, err)
-		return err
+		// Log the error from cmd.Run itself, as it might be different from the pre-checks
+		log.Printf("error running node-webkit command %s with package %s: %v", *nw_path, *nw_package, err)
+		// Wrap error from cmd.Run for the return value
+		return fmt.Errorf("error running node-webkit command %s with package %s: %w", *nw_path, *nw_package, err)
 	}
-	return
+	return nil // Explicitly return nil on success
 }
 
 func main() {
@@ -59,18 +87,27 @@ func main() {
 			log.Printf("UI Mode: Listening at :%d", *port)
 			err := http.ListenAndServe(fmt.Sprintf(":%d", *port), nil)
 			if err != nil {
-				log.Fatalf("UI Mode: Failed to listen on %d: %s", *port, err)
+				// Wrap error from http.ListenAndServe
+				log.Fatalf("UI Mode: Failed to listen on %d: %v", *port, fmt.Errorf("ListenAndServe failed: %w", err))
 			}
 		} else {
 			listener, err := net.Listen("tcp4", "127.0.0.1:0")
 			if err != nil {
-				log.Fatalf("UI Mode: Failed to listen: %s", err)
+				// Wrap error from net.Listen
+				log.Fatalf("UI Mode: Failed to listen on dynamic port: %v", fmt.Errorf("net.Listen failed: %w", err))
 			}
 			url := fmt.Sprintf("http://%s/", listener.Addr().String())
 			log.Printf("UI Mode: URL: %s", url)
 			log.Printf("UI Mode: Launching node-webkit UI...")
-			go openWindow(url)
-			panic(http.Serve(listener, nil))
+			go func() {
+				if err := openWindow(url); err != nil {
+					log.Printf("Error opening node-webkit window: %v", err) // Log wrapped error
+				}
+			}()
+			// http.Serve error is critical, so panic with wrapped error
+			if err := http.Serve(listener, nil); err != nil {
+				panic(fmt.Errorf("http.Serve failed: %w", err))
+			}
 		}
 	}
 }
@@ -81,7 +118,7 @@ func runCliBenchmark() {
 	// 1. Process nameservers
 	currentNameservers := parseNameservers(*nameservers, defaultNameservers)
 	if len(currentNameservers) == 0 {
-		log.Fatalf("No nameservers to test. Exiting.")
+		log.Fatalf("No nameservers to test. Exiting.") // No error to wrap here, it's a configuration issue
 		return
 	}
 	log.Printf("Using nameservers: %v", currentNameservers)
@@ -94,7 +131,8 @@ func runCliBenchmark() {
 		log.Println("Attempting to read domains from Chrome history...")
 		historyRecords, err := history.Chrome(ui.HISTORY_DAYS) // ui.HISTORY_DAYS is a const like 30
 		if err != nil {
-			log.Printf("Error reading Chrome history: %v. Falling back to default domain list.", err)
+			// Log the wrapped error from history.Chrome
+			log.Printf("Error reading Chrome history (will fall back to default list): %v", err)
 			domainsToTest = defaultDomains
 		} else if len(historyRecords) == 0 {
 			log.Println("No domains found in Chrome history. Falling back to default domain list.")
@@ -115,7 +153,8 @@ func runCliBenchmark() {
 		log.Printf("Attempting to read domains from file: %s", *domain_source)
 		loadedFileDomains, err := loadDomainsFromFile(*domain_source)
 		if err != nil {
-			log.Printf("Error loading domains from file '%s': %v. Falling back to default domain list.", *domain_source, err)
+			// Log the wrapped error from loadDomainsFromFile
+			log.Printf("Error loading domains from file '%s' (will fall back to default list): %v", *domain_source, err)
 			domainsToTest = defaultDomains
 		} else if len(loadedFileDomains) == 0 {
 			log.Printf("No domains found in file '%s'. Falling back to default domain list.", *domain_source)
@@ -127,36 +166,33 @@ func runCliBenchmark() {
 	}
 
 	if len(domainsToTest) == 0 {
-		log.Fatalf("No domains to test after processing source '%s'. Exiting.", *domain_source)
+		log.Fatalf("No domains to test after processing source '%s'. Exiting.", *domain_source) // Configuration issue
 		return
 	}
 
 	// Select -count unique domains
 	selectedDomains := history.Random(*count, domainsToTest)
 	if len(selectedDomains) == 0 {
-		log.Fatalf("Could not select any domains for testing (requested %d from a pool of %d). Exiting.", *count, len(domainsToTest))
+		log.Fatalf("Could not select any domains for testing (requested %d from a pool of %d). Exiting.", *count, len(domainsToTest)) // Configuration issue
 		return
 	}
 	log.Printf("Selected %d unique domains for testing: %v", len(selectedDomains), selectedDomains)
 
-	log.Printf("Starting benchmark with record type '%s'. DNSSEC flag: %t (Note: effective DNSSEC support depends on dnsqueue.Request update).", *record_type, *dnssec)
+	log.Printf("Starting benchmark with record type '%s'. DNSSEC flag: %t.", *record_type, *dnssec)
 
 	// 3. Benchmarking Loop
 	allResults := make(map[string][]dnsqueue.Result) // Key: nameserver string
+	benchmarkCtx := context.Background()             // Root context for this benchmark run
 
 	for _, ns := range currentNameservers {
 		log.Printf("--------------------------------------------------")
 		log.Printf("Testing nameserver: %s", ns)
 		log.Printf("--------------------------------------------------")
-		// Using ui.QUEUE_LENGTH and ui.WORKERS for consistency with UI mode for now.
 		q := dnsqueue.StartQueue(ui.QUEUE_LENGTH, ui.WORKERS)
 
 		for _, domain := range selectedDomains {
-			// The dnsqueue.Request struct needs to be updated to include VerifySignature field
-			// and dnsqueue.SendQuery needs to use it.
-			// For now, we are calling q.Add which creates a request without VerifySignature.
-			// This will be addressed in a subsequent step.
 			req := &dnsqueue.Request{
+				Ctx:             benchmarkCtx, // Pass context
 				Destination:     ns,
 				RecordType:      *record_type,
 				RecordName:      domain + ".", // Ensure trailing dot for FQDN
@@ -167,27 +203,30 @@ func runCliBenchmark() {
 		q.SendCompletionSignal()
 
 		answered := 0
-		var totalDuration time.Duration
-		var successfulQueries int
 		var currentNsResults []dnsqueue.Result
 		for {
 			if answered == len(selectedDomains) {
 				break
 			}
 			result := <-q.Results
-			currentNsResults = append(currentNsResults, result) // Store result
+			currentNsResults = append(currentNsResults, result)
 			answered++
-			// Logging during benchmark can be reduced if too verbose, will be printed later
 			if result.Error != "" {
+				// Log the error string from result.Error (already wrapped by dnsqueue.SendQuery)
 				log.Printf("Query for %s -> %s: Error: %s", result.Request.RecordName, result.Request.Destination, result.Error)
-			} else {
-				// log.Printf("Query for %s -> %s: Duration: %s, Answers: %d", result.Request.RecordName, result.Request.Destination, result.Duration, len(result.Answers))
-				totalDuration += result.Duration
+			}
+		}
+		allResults[ns] = currentNsResults
+		
+		// Calculate and log average for this nameserver (logging already exists)
+		var totalDuration time.Duration
+		var successfulQueries int
+		for _, r := range currentNsResults {
+			if r.Error == "" {
+				totalDuration += r.Duration
 				successfulQueries++
 			}
 		}
-		allResults[ns] = currentNsResults // Store all results for this nameserver
-
 		if successfulQueries > 0 {
 			log.Printf("Finished testing %s: Avg Duration: %s (%d/%d successful queries)", ns, totalDuration/time.Duration(successfulQueries), successfulQueries, len(selectedDomains))
 		} else {
@@ -198,11 +237,10 @@ func runCliBenchmark() {
 	log.Println("CLI benchmark finished. Processing results...")
 	log.Println("--------------------------------------------------")
 
-	// 2. Formatted Printing of Detailed Results
+	// 2. Formatted Printing of Detailed Results (code from previous step, assumed correct)
 	fmt.Println("\nNamebench CLI Mode Results")
 	fmt.Println("==========================")
 
-	// Sort nameservers for consistent output order
 	sortedNameservers := make([]string, 0, len(allResults))
 	for ns := range allResults {
 		sortedNameservers = append(sortedNameservers, ns)
@@ -227,7 +265,7 @@ func runCliBenchmark() {
 		for _, result := range resultsForNs {
 			fmt.Printf("  Domain: %s, Time: %s", result.Request.RecordName, result.Duration)
 			if result.Error != "" {
-				fmt.Printf(", Error: %s\n", result.Error)
+				fmt.Printf(", Error: %s\n", result.Error) // Error string is already wrapped
 			} else {
 				fmt.Println()
 				nsSuccessfulQueries++
@@ -254,17 +292,15 @@ func runCliBenchmark() {
 		})
 	}
 
-	// 3. Summary Section
+	// 3. Summary Section (code from previous step, assumed correct)
 	fmt.Println("\nSummary:")
 	fmt.Println("=======")
 
-	// Sort summaryData: primarily by AverageMs (asc), secondarily by SuccessfulQueries (desc)
 	sort.Slice(summaryData, func(i, j int) bool {
 		if summaryData[i].AverageMs == summaryData[j].AverageMs {
 			return summaryData[i].SuccessfulQueries > summaryData[j].SuccessfulQueries
 		}
-		// Handle cases where AverageMs might be 0 (no successful queries)
-		if summaryData[i].AverageMs == 0 && summaryData[j].AverageMs > 0 { // Treat 0 as "worse" than any positive avg
+		if summaryData[i].AverageMs == 0 && summaryData[j].AverageMs > 0 {
 			return false
 		}
 		if summaryData[j].AverageMs == 0 && summaryData[i].AverageMs > 0 {
@@ -280,14 +316,13 @@ func runCliBenchmark() {
 	}
 
 	if len(summaryData) > 0 {
-		// Identify fastest based on sorted list (could be multiple if ties)
 		fastestAvg := summaryData[0].AverageMs
 		fmt.Println("\nFastest Nameserver(s):")
 		for _, entry := range summaryData {
-			if entry.AverageMs == fastestAvg && entry.SuccessfulQueries > 0 { // Ensure it had successful queries
+			if entry.AverageMs == fastestAvg && entry.SuccessfulQueries > 0 {
 				fmt.Printf("- %s (Avg: %.2f ms, Success: %d/%d)\n",
 					entry.Nameserver, entry.AverageMs, entry.SuccessfulQueries, entry.TotalQueries)
-			} else if entry.AverageMs > fastestAvg && entry.AverageMs != 0 { // Stop if we are past the fastest tier
+			} else if entry.AverageMs > fastestAvg && entry.AverageMs != 0 {
 				break
 			}
 		}
@@ -315,7 +350,7 @@ func parseNameservers(nsFlag string, defaultNS []string) []string {
 		}
 		parsed = append(parsed, ns)
 	}
-	if len(parsed) == 0 { // Should not happen if nsFlag is not empty, but as a safeguard
+	if len(parsed) == 0 {
 		log.Printf("Nameserver flag processing resulted in empty list, using defaults: %v", defaultNS)
 		return defaultNS
 	}
@@ -328,7 +363,7 @@ func loadDomainsFromFile(filePath string) ([]string, error) {
 	var domains []string
 	file, err := os.Open(filePath)
 	if err != nil {
-		return nil, fmt.Errorf("opening domain file '%s': %w", filePath, err)
+		return nil, fmt.Errorf("failed to open domain file %s: %w", filePath, err)
 	}
 	defer file.Close()
 
@@ -340,7 +375,8 @@ func loadDomainsFromFile(filePath string) ([]string, error) {
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("reading domain file '%s': %w", filePath, err)
+		// Wrap scanner.Err()
+		return domains, fmt.Errorf("error scanning domain file %s: %w", filePath, err)
 	}
 	return domains, nil
 }

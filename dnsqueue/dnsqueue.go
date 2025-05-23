@@ -2,6 +2,7 @@
 package dnsqueue
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"github.com/miekg/dns"
@@ -11,12 +12,11 @@ import (
 
 // Request contains data for making a DNS request
 type Request struct {
+	Ctx             context.Context // Context for the request
 	Destination     string
 	RecordType      string
 	RecordName      string
 	VerifySignature bool
-
-	exit bool
 }
 
 // Answer contains a single answer returned by a DNS server.
@@ -39,7 +39,7 @@ type Queue struct {
 	Requests    chan *Request
 	Results     chan *Result
 	WorkerCount int
-	Quit        chan bool
+	Quit        chan bool // This field is unused now, can be removed if no other plans for it.
 }
 
 // StartQueue starts a new queue with max length of X with worker count Y.
@@ -55,74 +55,85 @@ func StartQueue(size, workers int) (q *Queue) {
 	return
 }
 
-// Queue.Add adds a request to the queue. Only blocks if queue is full.
-func (q *Queue) Add(dest, record_type, record_name string) {
-	q.Requests <- &Request{
-		Destination: dest,
-		RecordType:  record_type,
-		RecordName:  record_name,
+// Add adds a request to the queue. Only blocks if queue is full.
+// It now accepts a context.Context and verifySignature.
+func (q *Queue) Add(ctx context.Context, dest, record_type, record_name string, verifySignature bool) {
+	if ctx == nil {
+		log.Println("Warning: dnsqueue.Add called with nil context. Using context.Background().")
+		ctx = context.Background()
 	}
+	req := &Request{
+		Ctx:             ctx,
+		Destination:     dest,
+		RecordType:      record_type,
+		RecordName:      record_name,
+		VerifySignature: verifySignature,
+	}
+	q.Requests <- req
 }
 
-// Queue.SendDieSignal sends a signal to the workers that they can go home now.
+// SendCompletionSignal closes the Requests channel, signaling workers to complete.
 func (q *Queue) SendCompletionSignal() {
-	log.Printf("Sending completion signal...")
-	for i := 0; i < q.WorkerCount; i++ {
-		q.Requests <- &Request{exit: true}
-	}
+	log.Printf("Closing requests channel to signal completion...")
+	close(q.Requests)
 }
 
 // startWorker starts a thread to watch the request channel and populate result channel.
+// It now ranges over the queue and exits when the channel is closed.
 func startWorker(queue <-chan *Request, results chan<- *Result) {
 	for request := range queue {
-		if request.exit {
-			log.Printf("Completion received, worker is done.")
-			return
+		ctxToUse := request.Ctx
+		if ctxToUse == nil {
+			log.Printf("Warning: Request for %s to %s had nil Ctx, using context.Background().", request.RecordName, request.Destination)
+			ctxToUse = context.Background()
 		}
-		result, err := SendQuery(request)
+		result, err := SendQuery(ctxToUse, request)
 		if err != nil {
-			log.Printf("Error sending query: %s", err)
+			// Error is already wrapped and stored in result.Error by SendQuery
+			// Log that an error occurred, the details are in result.Error
+			// log.Printf("Query for %s to %s resulted in error: %s", request.RecordName, request.Destination, err)
 		}
-		log.Printf("Sending back result: %s", result)
 		results <- &result
 	}
+	log.Printf("Worker finished as requests channel was closed.")
 }
 
-// Send a DNS query via UDP, configured by a Request object. If successful,
-// stores response details in Result object, otherwise, returns Result object
+// SendQuery sends a DNS query via UDP, configured by a Request object and controlled by a Context.
+// If successful, stores response details in Result object, otherwise, returns Result object
 // with an error string.
-func SendQuery(request *Request) (result Result, err error) {
-	log.Printf("Sending query: %s", request)
+func SendQuery(ctx context.Context, request *Request) (result Result, err error) {
 	result.Request = *request
 
 	record_type, ok := dns.StringToType[request.RecordType]
 	if !ok {
-		result.Error = fmt.Sprintf("Invalid type: %s", request.RecordType)
-		return result, errors.New(result.Error)
+		err = fmt.Errorf("invalid DNS record type %q for domain %s", request.RecordType, request.RecordName)
+		result.Error = err.Error()
+		return result, err
 	}
 
 	m := new(dns.Msg)
-	if request.VerifySignature == true {
-		log.Printf("SetEdns0 for %s", request.RecordName)
+	if request.VerifySignature {
 		m.SetEdns0(4096, true)
 	}
 	m.SetQuestion(request.RecordName, record_type)
 	c := new(dns.Client)
-	in, rtt, err := c.Exchange(m, request.Destination)
-	// log.Printf("Answer: %s [%d] %s", in, rtt, err)
 
+	in, rtt, exchangeErr := c.ExchangeContext(ctx, m, request.Destination)
 	result.Duration = rtt
-	if err != nil {
+
+	if exchangeErr != nil {
+		err = fmt.Errorf("dns exchange failed for %s to %s (record type %s): %w", request.RecordName, request.Destination, request.RecordType, exchangeErr)
 		result.Error = err.Error()
-	} else {
-		for _, rr := range in.Answer {
-			answer := Answer{
-				Ttl:    rr.Header().Ttl,
-				Name:   rr.Header().Name,
-				String: rr.String(),
-			}
-			result.Answers = append(result.Answers, answer)
+		return result, err
+	}
+
+	for _, rr := range in.Answer {
+		answer := Answer{
+			Ttl:    rr.Header().Ttl,
+			Name:   rr.Header().Name,
+			String: rr.String(),
 		}
+		result.Answers = append(result.Answers, answer)
 	}
 	return result, nil
 }
